@@ -165,7 +165,51 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
-    return;
+    char *argv[MAXARGS];
+    int bg; // 是否为后台任务，后台为1，前台为0
+    pid_t pid;
+
+    bg = parseline(cmdline, argv);
+
+    // 跳过空行
+    if (argv[0] == NULL) return;
+    // 判断是否为内置命令
+    if (!builtin_cmd(argv)) {
+        // 如果不是内置命令
+        sigset_t mask, prev;
+        // 阻塞SIGCHLD信号
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &mask, &prev);
+
+        if ((pid = fork()) == 0) {
+            // 对子进程
+            // 不再阻塞SIGCHLD
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            // 为当前子进程创建新的进程组，其pgid为当前子进程的pid
+            setpgid(0, 0);
+            // 执行命令
+            if (execve(argv[0], argv, environ) < 0) {
+                printf("%s: Command not found\n", argv[0]);
+                exit(0);
+            }
+        }
+        // 对父进程
+        if (!bg) {
+            // 将子进程加入前台任务
+            addjob(jobs, pid, FG, cmdline);
+            // 不再阻塞SIGCHLD
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            // 对于前台作业，父进程需等待结束
+            waitfg(pid);
+        } else {
+            // 将子进程加入后台任务
+            addjob(jobs, pid, BG, cmdline);
+            // 不再阻塞SIGCHLD
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+        }
+    }
 }
 
 /* 
@@ -231,6 +275,18 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+    if (strcmp(argv[0], "quit") == 0) {
+        // quit命令，该进程直接exit退出
+        exit(0);
+    } else if (strcmp(argv[0], "jobs") == 0) {
+        // jobs命令，列出所有任务
+        listjobs(jobs);
+        return 1;
+    } else if (strcmp(argv[0], "bg") == 0 || strcmp(argv[0], "fg") == 0) {
+        // bg / fg，处理前后台任务
+        do_bgfg(argv);
+        return 1;
+    }
     return 0;     /* not a builtin command */
 }
 
@@ -239,7 +295,44 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
-    return;
+    struct job_t *job;
+    int jid;
+
+    // 无参数
+    if (argv[1] == NULL) {
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+    // %JID
+    if (argv[1][0] == '%') {
+        jid = atoi(&argv[1][1]);
+        if (!(job = getjobjid(jobs, jid))) {
+            printf("%%%d: No such job\n", jid);
+            return;
+        }
+    // PID
+    } else if (isdigit(argv[1][0])) {
+        pid_t pid = atoi(argv[1]);
+        if (!(job = getjobpid(jobs, pid))) {
+            printf("(%d): No such process\n", pid);
+            return;
+        }
+    } else {
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }
+    
+    if (!strcmp(argv[0], "bg")) {
+        // bg：后台任务
+        job->state = BG;
+        printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+        kill(-(job->pid), SIGCONT);
+    } else {
+        // fg：前台任务
+        job->state = FG;
+        kill(-(job->pid), SIGCONT);
+        waitfg(job->pid);
+    }
 }
 
 /* 
@@ -247,7 +340,13 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
-    return;
+    sigset_t mask;
+    sigemptyset(&mask);
+
+    if (pid == 0) return;
+    while (pid == fgpid(jobs)) {
+        sigsuspend(&mask);
+    }
 }
 
 /*****************
@@ -263,7 +362,32 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
-    return;
+    int old_errno = errno;
+    pid_t pid;
+    int status;
+    struct job_t *job;
+
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        job = getjobpid(jobs, pid);
+        if (WIFEXITED(status)) {
+            // 子进程正常终止
+            deletejob(jobs, pid);
+        } else if (WIFSIGNALED(status)) {
+            // 子进程因为未被捕获的信号终止
+            printf("Job [%d] (%d) terminated by signal %d\n", job->jid, job->pid, WTERMSIG(status));
+            deletejob(jobs, pid);
+        } else if (WIFSTOPPED(status)) {
+            // 子进程是停止的，修改状态即可
+            job->state = ST;
+            printf("Job [%d] (%d) stopped by signal %d\n", job->jid, job->pid, WSTOPSIG(status));
+        }
+    }
+
+    if (pid < 0 && errno != ECHILD) {
+        unix_error("waitpid error");
+    }
+
+    errno = old_errno;
 }
 
 /* 
@@ -273,7 +397,12 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
-    return;
+    pid_t pid = fgpid(jobs);
+
+    if (pid != 0) {
+        kill(-pid, sig);
+        //printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, sig);
+    }
 }
 
 /*
@@ -283,7 +412,12 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
-    return;
+    pid_t pid = fgpid(jobs);
+
+    if (pid != 0) {
+        kill(-pid, sig);
+        //printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, sig);
+    }
 }
 
 /*********************
